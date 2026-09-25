@@ -18,7 +18,7 @@
  */
 
 /**
- * @brief  Distributed MMC voltage balancing. SM1 broadcasts the sine reference.
+ * @brief  Distributed MMC voltage balancing. SM1 broadcasts arm insertion counts.
  *         This research was funded in whole by the French National Research Agency (ANR) under the project CARROTS "ANR-24-CE05-0920-01".
  *
  * @author Ayoub Farah Hassan <ayoub.farah-hassan@laas.fr>
@@ -135,23 +135,6 @@ constexpr float32_t Cap_voltage_SCALE = Vcap_expected*2; //[V] Scale for 12-bit 
 constexpr float32_t Arm_current_SCALE = i_expected*2; //[A] Scale for 12-bit current measurements
 constexpr float32_t Arm_current_OFFSET = i_expected; //[A] Offset for signed current measurements
 
-// Signed transport of sin(angle), without the modulation amplitude m.
-// -32768 is reserved as invalid; all boards decode the same quantized reference.
-constexpr int16_t MMC_SINE_REFERENCE_MAX = 32767;
-constexpr int16_t MMC_SINE_REFERENCE_INVALID = -32768;
-
-static inline int16_t mmc_encode_sine_reference(float32_t sine)
-{
-    if (sine >= 1.0F) return MMC_SINE_REFERENCE_MAX;
-    if (sine <= -1.0F) return -MMC_SINE_REFERENCE_MAX;
-    return static_cast<int16_t>(roundf(sine * MMC_SINE_REFERENCE_MAX));
-}
-
-static inline float32_t mmc_decode_sine_reference(int16_t raw)
-{
-    return static_cast<float32_t>(raw) / MMC_SINE_REFERENCE_MAX;
-}
-
 /**
  * @brief Encode an capacitor voltage into the 12-bit transport format.
  *
@@ -208,17 +191,18 @@ void loop_communication_task();
 
 /* --------------USER VARIABLES DECLARATIONS------------------- */
 
-// Only known boards can participate; SM1 generates the common sine reference.
+// Only known boards can participate; SM1 generates the arm insertion counts.
 uint8_t module_ID = detect_module_id();
-static float32_t module_command = 0.0F; // PWM duty cycle in [0, 1].
+static float32_t module_command = 0.0F; // 1 = inserted, 0 = bypassed.
 static bool power_requested = false; // SM1: a new 'p' is required after every fault.
 static volatile char requested_command = 0; // Console publishes; control consumes.
 
-// One frame per module. Only SM1's sine reference is used as a command.
-// The first two bytes replace the old insertion counts: update all boards together.
+// SM1 supplies the two global insertion counts.
+// Protocol change from sine-reference PWM: update all boards together.
 struct MMC_frame_t
 {
-    int16_t sine_reference_raw;
+    uint8_t upper_insert_count;
+    uint8_t lower_insert_count;
     uint16_t cycle_id;
     uint16_t capacitor_voltage_raw : 12;
     uint16_t arm_current_raw : 12;
@@ -231,24 +215,15 @@ static bool mmc_is_upper_arm_module(uint8_t id)
     return id >= MMC_SM1 && id <= MMC_SM5;
 }
 
-static bool mmc_get_neighbors(uint8_t id, uint8_t &prev_id, uint8_t &next_id)
-{
-    if (id < MMC_SM_FIRST || id > MMC_SM_LAST) return false;
-    const uint8_t base = mmc_is_upper_arm_module(id) ? MMC_SM1 : MMC_SM6;
-    const uint8_t rank = id - base;
-    prev_id = base + (rank + total_number_of_modules_arm - 1U) % total_number_of_modules_arm;
-    next_id = base + (rank + 1U) % total_number_of_modules_arm;
-    return true;
-}
-
-// Received neighbor voltages used by the consensus law.
-// RX and control never overlap, so one copy is enough.
-static float32_t MMC_capacitor_voltage_prev = 0.0F;
-static float32_t MMC_capacitor_voltage_next = 0.0F;
+// Exact transmitted samples, including our own, ensure identical local ranks.
+static uint16_t capacitor_voltage_raw[MMC_SM_COUNT] = {};
 static bool measurement_received[MMC_SM_COUNT] = {};
 static uint8_t received_module_count = 0;
-static uint8_t consensus_prev_id = 0;
-static uint8_t consensus_next_id = 0;
+// SM1 supplies the upper-arm current; SM6 supplies the lower-arm current.
+static float32_t upper_arm_current_reference = 0.0F;
+static float32_t lower_arm_current_reference = 0.0F;
+static float32_t upper_insert_count_scope = 0.0F;
+static float32_t lower_insert_count_scope = 0.0F;
 
 // Scheduling assumption: RS485 reception and control never overlap.
 // Each exchange finishes before the next control tick; no interrupt locking.
@@ -281,7 +256,7 @@ enum serial_interface_menu_mode
 
 serial_interface_menu_mode mode = IDLEMODE;
 
-/* --------------- Local consensus PWM variables ------------------*/
+/* --------------- Distributed insertion variables ------------------*/
 
 /* [us] period of the control task (=critical task) */
 static constexpr uint32_t control_task_period = 200; // us
@@ -294,25 +269,26 @@ static uint32_t critical_task_timer = 0;
 /* Scope variables */
 static bool enable_acq; // Sets trigger moment if true
 static const uint16_t NB_DATAS = 1028; // Number of data acquired
-static ScopeMimicry scope(NB_DATAS, 5); // Local voltages, current and PWM duty
+static ScopeMimicry scope(NB_DATAS, 5); // Voltage, arm counts, shared current and insertion
 static bool is_downloading; // Records data if true
 static uint32_t scope_timer = 0;
 static uint32_t scope_period = 1; // scope acquire data every t = scope_period * critical_task_period (200 µs) s;
 
-/* Continuous modulation; preserve the firmware's upper/lower sine signs. */
-static float32_t m = 1; // Modulation amplitude: identical on every board
-static float32_t a = 1; // Modulation dc part: identical on every board
+/* NLM modulation on SM1; preserve the firmware's upper/lower sine signs. */
+static float32_t m = 1; // Modulation amplitude, used by SM1
+static float32_t a = 1; // Modulation dc part, used by SM1
 static float32_t angle;
 static const float32_t w0 = 2 * PI * f0; // Angular frequency
 
-static bool mmc_compute_arm_modulation(int16_t sine_reference_raw, float32_t &modulation_signal)
+static bool mmc_compute_insertion_counts(float32_t sine, MMC_frame_t &frame)
 {
-    if (sine_reference_raw == MMC_SINE_REFERENCE_INVALID) return false;
-
-    const float32_t sine = mmc_decode_sine_reference(sine_reference_raw);
-    modulation_signal = mmc_is_upper_arm_module(module_ID)
-        ? 0.5F * (a + m * sine) : 0.5F * (a - m * sine);
-    return modulation_signal >= 0.0F && modulation_signal <= 1.0F;
+    const float32_t upper = 0.5F * (a + m * sine);
+    const float32_t lower = 0.5F * (a - m * sine);
+    if (!(upper >= 0.0F && upper <= 1.0F && lower >= 0.0F && lower <= 1.0F))
+        return false;
+    frame.upper_insert_count = static_cast<uint8_t>(roundf(total_number_of_modules_arm * upper));
+    frame.lower_insert_count = static_cast<uint8_t>(roundf(total_number_of_modules_arm * lower));
+    return true;
 }
 
 /* --------------SETUP FUNCTIONS------------------------------- */
@@ -400,7 +376,9 @@ static bool begin_cycle(const MMC_frame_t &frame)
     }
     if (frame.status == IDLE)
         communication_fault = 0; // Recovery still requires usable measurements and a new 'p'.
-    if (frame.status > POWER || frame.sine_reference_raw == MMC_SINE_REFERENCE_INVALID)
+    if (frame.status > POWER ||
+        frame.upper_insert_count > total_number_of_modules_arm ||
+        frame.lower_insert_count > total_number_of_modules_arm)
         communication_fault = COMMUNICATION_ERROR;
 
     cycle_command = frame;
@@ -408,13 +386,24 @@ static bool begin_cycle(const MMC_frame_t &frame)
     return true;
 }
 
-// Count accepted remote frames; store only same-arm neighbor voltages.
+static void store_cycle_sample(const MMC_frame_t &frame)
+{
+    capacitor_voltage_raw[frame.sm_id - MMC_SM_FIRST] = frame.capacitor_voltage_raw;
+    const float32_t current = Arm_current_SCALE * static_cast<float32_t>(frame.arm_current_raw) / 4095.0F
+        - Arm_current_OFFSET;
+    if (frame.sm_id == MMC_SM1) upper_arm_current_reference = current;
+    if (frame.sm_id == MMC_SM6) lower_arm_current_reference = current;
+}
+
+// Count accepted frames and keep measurements from this exchange.
 static bool store_module_measurements(const MMC_frame_t &frame)
 {
     if (!cycle_started || frame.sm_id < MMC_SM_FIRST || frame.sm_id > MMC_SM_LAST)
         return false;
     if (frame.sm_id != MMC_SM1 && !measurement_received[0]) return false;
-    if (frame.cycle_id != cycle_command.cycle_id)
+    if (frame.cycle_id != cycle_command.cycle_id ||
+        frame.upper_insert_count != cycle_command.upper_insert_count ||
+        frame.lower_insert_count != cycle_command.lower_insert_count)
     {
         communication_fault = COMMUNICATION_ERROR;
         return false;
@@ -426,10 +415,7 @@ static bool store_module_measurements(const MMC_frame_t &frame)
     else if (frame.status != cycle_command.status) communication_fault = COMMUNICATION_ERROR;
     measurement_received[index] = true;
     received_module_count++;
-    if (frame.sm_id == consensus_prev_id)
-        MMC_capacitor_voltage_prev = mmc_decode_voltage(frame.capacitor_voltage_raw);
-    if (frame.sm_id == consensus_next_id)
-        MMC_capacitor_voltage_next = mmc_decode_voltage(frame.capacitor_voltage_raw);
+    store_cycle_sample(frame);
     return true;
 }
 
@@ -443,6 +429,7 @@ static void send_own_measurements()
     frame.capacitor_voltage_raw = mmc_encode_voltage(Cap_voltage);
     frame.arm_current_raw = mmc_encode_current(Arm_current);
     if (communication_fault) frame.status = communication_fault;
+    store_cycle_sample(frame);
     // Include our own slot in the round without waiting for an echo.
     measurement_received[index] = true;
     received_module_count++;
@@ -460,7 +447,7 @@ void reception_function()
         if (module_ID == MMC_SM1 || !begin_cycle(frame)) return;
     }
     const bool accepted = store_module_measurements(frame);
-    // Bus predecessor is independent of the consensus rings (notably SM5 -> SM6).
+    // Bus order: SM1 -> SM2 -> ... -> SM10, across both arms.
     if (module_ID != MMC_SM1 && accepted && frame.sm_id == module_ID - 1)
         send_own_measurements();
     counter_receive++;
@@ -482,7 +469,6 @@ void setup_routine()
         printk("Unknown board: control and communication disabled\n");
         return;
     }
-    if (!mmc_get_neighbors(module_ID, consensus_prev_id, consensus_next_id)) return;
 
     config_led_LL(); // Configure the LED pin in Low Level
 
@@ -537,10 +523,10 @@ void setup_routine()
 
         /* Configures scopemimicry measured variables */
         scope.connectChannel(Cap_voltage, "vc_self");
-        scope.connectChannel(MMC_capacitor_voltage_prev, "vc_prev");
-        scope.connectChannel(MMC_capacitor_voltage_next, "vc_next");
-        scope.connectChannel(Arm_current, "i_arm_self");
-        scope.connectChannel(module_command, "local_duty");
+        scope.connectChannel(upper_insert_count_scope, "N_upper");
+        scope.connectChannel(lower_insert_count_scope, "N_lower");
+        scope.connectChannel(upper_arm_current_reference, "i_upper_ref");
+        scope.connectChannel(module_command, "inserted");
         scope.set_trigger(&a_trigger);
         scope.set_delay(0.0F);
         scope.start();
@@ -551,12 +537,8 @@ void setup_routine()
         communication.sync.initSlave();
     }
     shield.power.stop(ALL);
-    // Carrier phases: 0/72/144/216/288 deg in the upper arm, +36 deg in the lower.
-    const uint8_t rank = (module_ID - MMC_SM_FIRST) % total_number_of_modules_arm;
-    int16_t phase_shift = 360 * rank / total_number_of_modules_arm;
-    if (!mmc_is_upper_arm_module(module_ID))
-        phase_shift += 180 / total_number_of_modules_arm;
-    shield.power.setPhaseShift(LEG2, phase_shift);
+    // Binary insertion uses the same switching phase on every module.
+    shield.power.setPhaseShift(LEG2, 0);
     task.startBackground(background_task_number);
     task.startBackground(CommTask_num);
     task.startCritical();
@@ -567,7 +549,7 @@ void setup_routine()
 /**
  * This is the communication task.
  * It is used to send to the board via the computer the desired mode
- * IDLE (i) = block all modules or POWER (p) = operate with neighbor consensus PWM.
+ * IDLE (i) = block all modules or POWER (p) = operate with distributed capacitor-voltage sorting.
  * 
  * It also sends data acquisition start command (a) and scope data retrieve commands (r).
  */
@@ -638,42 +620,22 @@ void loop_background_task()
     task.suspendBackgroundMs(2000);
 }
 
-/* Algebraic neighbor law from hb_sm_local_ctrl_neighbor (SLX controller).
- * Source gains, to validate at 200 us on the actual converter; no integrator.
- */
-constexpr float32_t MMC_CONSENSUS_K_V = 0.2F;
-constexpr float32_t MMC_VOLTAGE_DEADBAND_V = 0.1F;
-constexpr float32_t MMC_CURRENT_SCALE_A = 1.0F;
-
-static inline float32_t mmc_smooth_current_direction(float32_t arm_current)
+// Rank against shared quantized voltages; ties favor the smaller SM identifier.
+static float32_t mmc_local_insertion()
 {
-    // Approximate tanh(x), saturated at +/-1 for normalized currents beyond +/-3.
-    constexpr float32_t inv_current_scale = 1.0F / MMC_CURRENT_SCALE_A;
-    const float32_t x = arm_current * inv_current_scale;
-
-    if (x >= 3.0F) return 1.0F;
-    if (x <= -3.0F) return -1.0F;
-
-    const float32_t x2 = x * x;
-    return x * (27.0F + x2) / (27.0F + 9.0F * x2);
-}
-
-static inline float32_t mmc_consensus_neighbor_error(float32_t vc_i, float32_t vc_prev, float32_t vc_next)
-{
-    float32_t err = 0.5F * (vc_prev + vc_next) - vc_i;
-    if (fabsf(err) < MMC_VOLTAGE_DEADBAND_V) err = 0.0F;
-    return err;
-}
-
-static float32_t mmc_local_consensus_duty(float32_t modulation_signal,
-                                        float32_t vc_i, float32_t vc_prev,
-                                        float32_t vc_next, float32_t arm_current)
-{
-    const float32_t err = mmc_consensus_neighbor_error(vc_i, vc_prev, vc_next);
-    const float32_t unsaturated = modulation_signal + MMC_CONSENSUS_K_V * err * mmc_smooth_current_direction(arm_current);
-    if (unsaturated < 0.0F) return 0.0F;
-    if (unsaturated > 1.0F) return 1.0F;
-    return unsaturated;
+    const bool upper = mmc_is_upper_arm_module(module_ID);
+    const uint8_t first = upper ? MMC_SM1 : MMC_SM6;
+    const uint8_t count = upper ? cycle_command.upper_insert_count : cycle_command.lower_insert_count;
+    const float32_t current = upper ? upper_arm_current_reference : lower_arm_current_reference;
+    const uint16_t own_voltage = capacitor_voltage_raw[module_ID - MMC_SM_FIRST];
+    uint8_t rank = 0;
+    for (uint8_t id = first; id < first + total_number_of_modules_arm; ++id)
+    {
+        const uint16_t voltage = capacitor_voltage_raw[id - MMC_SM_FIRST];
+        const bool ahead = current >= 0.0F ? voltage < own_voltage : voltage > own_voltage;
+        if (ahead || (voltage == own_voltage && id < module_ID)) ++rank;
+    }
+    return rank < count ? 1.0F : 0.0F;
 }
 
 /**
@@ -710,20 +672,10 @@ void loop_critical_task()
     module_command = 0.0F;
     if (mode == POWERMODE)
     {
-        float32_t modulation_signal = 0.0F;
-        if (!mmc_compute_arm_modulation(cycle_command.sine_reference_raw, modulation_signal))
-        {
-            communication_fault = COMMUNICATION_ERROR;
-            power_requested = false;
-            mode = IDLEMODE;
-        }
-        else
-        {
-            module_command = mmc_local_consensus_duty(modulation_signal,
-                Cap_voltage, MMC_capacitor_voltage_prev,
-                MMC_capacitor_voltage_next, Arm_current);
-        }
+        module_command = mmc_local_insertion();
     }
+    upper_insert_count_scope = cycle_command.upper_insert_count;
+    lower_insert_count_scope = cycle_command.lower_insert_count;
     if (mode == POWERMODE)
     {
         shield.power.setDutyCycle(LEG2, module_command);
@@ -756,8 +708,14 @@ void loop_critical_task()
         if (power_requested)
         {
             angle = ot_modulo_2pi(angle + w0 * Ts);
-            next_command.sine_reference_raw = mmc_encode_sine_reference(ot_sin(angle));
-            next_command.status = POWER;
+            if (mmc_compute_insertion_counts(ot_sin(angle), next_command))
+                next_command.status = POWER;
+            else
+            {
+                communication_fault = COMMUNICATION_ERROR;
+                power_requested = false;
+                next_command.status = COMMUNICATION_ERROR;
+            }
         }
         else angle = 0.0F;
         if (begin_cycle(next_command)) send_own_measurements();
