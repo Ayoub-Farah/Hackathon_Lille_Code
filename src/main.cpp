@@ -59,6 +59,7 @@
 
 #define IDLE 0
 #define POWER 1
+#define DISCOVERY 2 // SM1 polls the module named by upper_insert_count; PWM stays off.
 #define OVER_VOLTAGE 3
 #define OVER_CURRENT 5
 #define COMMUNICATION_ERROR 6
@@ -244,6 +245,11 @@ static MMC_frame_t cycle_command;
 static MMC_frame_t next_command; // Prepared by SM1 for the next communication window.
 static bool cycle_started = false;
 static volatile uint8_t communication_fault = 0;
+static volatile bool bus_ready = false;
+static volatile uint16_t discovery_present_mask = 1U; // SM1 is local.
+static uint16_t discovery_sweep_mask = 1U;
+static uint8_t discovery_target = MMC_SM2;
+static constexpr uint16_t ALL_MODULES_MASK = (1U << MMC_SM_COUNT) - 1U;
 
 constexpr size_t MMC_FRAME_SIZE = sizeof(MMC_frame_t);
 uint8_t buffer_tx[MMC_FRAME_SIZE];
@@ -273,6 +279,12 @@ volatile serial_interface_menu_mode mode = IDLEMODE;
 
 /* [us] period of the control task (=critical task) */
 static constexpr uint32_t control_task_period = 200; // us
+// Let followers enter their synchronized control task before SM1 opens the bus.
+// This is a boot grace period, not an acknowledgement that every board is ready.
+static constexpr uint32_t communication_startup_delay_us = 1000000; // 1 s
+static constexpr uint32_t communication_startup_cycles =
+    (communication_startup_delay_us + control_task_period - 1) / control_task_period;
+static uint32_t communication_startup_ticks = 0;
 static float32_t Ts = control_task_period * 1e-6F; // s
 /* [bool] state of the PWM (ctrl task) */
 static bool pwm_enable = false;
@@ -403,7 +415,7 @@ static bool begin_cycle(const MMC_frame_t &frame)
             communication_fault = COMMUNICATION_ERROR;
         return false;
     }
-    if (frame.status == IDLE) communication_fault = 0;
+    if (frame.status == IDLE || frame.status == DISCOVERY) communication_fault = 0;
     if (cycle_started)
     {
         const uint16_t advance = static_cast<uint16_t>(frame.cycle_id - cycle_command.cycle_id);
@@ -470,7 +482,9 @@ static void send_own_measurements()
     frame.sm_id = module_ID;
     frame.capacitor_voltage_raw = mmc_encode_voltage(Cap_voltage);
     frame.arm_current_raw = mmc_encode_current(Arm_current);
-    if (communication_fault) frame.status = communication_fault;
+    // SM1 must preserve the discovery request even after an incomplete run.
+    if (communication_fault && !(module_ID == MMC_SM1 && cycle_command.status == DISCOVERY))
+        frame.status = communication_fault;
     const bool action_is_previous = previous_action_valid &&
         static_cast<uint16_t>(previous_action_cycle_id + 1U) == frame.cycle_id;
     frame.previous_status = action_is_previous ? previous_action_status : ACTION_UNAVAILABLE;
@@ -496,8 +510,17 @@ void reception_function()
     }
     const bool accepted = store_module_measurements(frame);
     // Bus order: SM1 -> SM2 -> ... -> SM10, across both arms.
-    if (module_ID != MMC_SM1 && accepted && frame.sm_id == module_ID - 1)
-        send_own_measurements();
+    if (module_ID != MMC_SM1 && accepted)
+    {
+        if (cycle_command.status == DISCOVERY)
+        {
+            // Independent polling: a missing SM2 must not silence SM3..SM10.
+            if (frame.sm_id == MMC_SM1 && cycle_command.upper_insert_count == module_ID)
+                send_own_measurements();
+        }
+        else if (frame.sm_id == module_ID - 1)
+            send_own_measurements();
+    }
     counter_receive++;
 }
 
@@ -645,6 +668,12 @@ void loop_communication_task()
     case 'p':
         if (module_ID == MMC_SM1)
         {
+            if (!bus_ready)
+            {
+                printk("Power blocked: bus discovery incomplete (present mask 0x%03x)\n",
+                       static_cast<unsigned>(discovery_present_mask));
+                break;
+            }
             if (mode == IDLEMODE && !is_downloading)
             {
                 scope_rearm_requested = true;
@@ -684,6 +713,20 @@ void loop_background_task()
 {
     if (module_ID == MMC_SM1)
     {
+        static uint16_t last_present_mask = 0;
+        static bool last_ready = false;
+        const uint16_t present = discovery_present_mask;
+        const bool ready = bus_ready;
+        if (present != last_present_mask || ready != last_ready)
+        {
+            printk("Bus %s; present mask 0x%03x; missing:",
+                   ready ? "ready (press p)" : "discovery", static_cast<unsigned>(present));
+            for (uint8_t id = MMC_SM2; id <= MMC_SM_LAST; ++id)
+                if (!(present & (1U << (id - 1)))) printk(" SM%u", id);
+            printk("\n");
+            last_present_mask = present;
+            last_ready = ready;
+        }
         if (mode == IDLEMODE)
         {
             spin.led.turnOff();
@@ -786,6 +829,18 @@ static void mmc_update_debug_scope()
  */
 void loop_critical_task()
 {
+    if (module_ID == MMC_SM1 && communication_startup_ticks < communication_startup_cycles)
+    {
+        ++communication_startup_ticks;
+        mode = IDLEMODE;
+        module_command = 0.0F;
+        if (pwm_enable) shield.power.stop(ALL);
+        pwm_enable = false;
+        update_measurements();
+        mmc_check_power_limits();
+        // Keep the control/synchronization timers running; only defer exchanges.
+        return;
+    }
     if (module_ID == MMC_SM1 && scope_rearm_requested)
     {
         if (!is_downloading)
@@ -799,12 +854,35 @@ void loop_critical_task()
     }
     // The preceding exchange is finished before control starts.
     const bool round_complete = received_module_count == MMC_SM_COUNT;
-    if (cycle_started && !round_complete)
+    const bool discovery_round = cycle_started && cycle_command.status == DISCOVERY;
+    if (module_ID == MMC_SM1 && discovery_round)
+    {
+        if (discovery_target == MMC_SM2) discovery_sweep_mask = 1U;
+        if (measurement_received[discovery_target - 1])
+            discovery_sweep_mask |= (1U << (discovery_target - 1));
+        if (discovery_target == MMC_SM_LAST)
+        {
+            discovery_present_mask = discovery_sweep_mask;
+            bus_ready = discovery_sweep_mask == ALL_MODULES_MASK;
+            discovery_target = MMC_SM2;
+        }
+        else ++discovery_target;
+    }
+    if (cycle_started && !discovery_round && !round_complete)
+    {
         communication_fault = COMMUNICATION_ERROR;
+        if (module_ID == MMC_SM1)
+        {
+            bus_ready = false;
+            discovery_target = MMC_SM2;
+            discovery_present_mask = 1U;
+        }
+    }
     update_measurements();
     mmc_check_power_limits();
 
-    if (communication_fault) mode = IDLEMODE;
+    if (communication_fault || discovery_round || (module_ID == MMC_SM1 && !bus_ready))
+        mode = IDLEMODE;
 
     // Apply insertion only once all samples for the POWER cycle are available.
     const bool apply_power = mode == POWERMODE && round_complete && cycle_command.status == POWER;
@@ -865,7 +943,13 @@ void loop_critical_task()
         next_command = {};
         next_command.sm_id = MMC_SM1;
         next_command.cycle_id = static_cast<uint16_t>(cycle_command.cycle_id + 1U);
-        if (mode == POWERMODE)
+        if (!bus_ready)
+        {
+            next_command.status = DISCOVERY;
+            next_command.upper_insert_count = discovery_target;
+            angle = 0.0F;
+        }
+        else if (mode == POWERMODE)
         {
             angle = ot_modulo_2pi(angle + w0 * Ts);
             mmc_compute_insertion_counts(ot_sin(angle), next_command);
