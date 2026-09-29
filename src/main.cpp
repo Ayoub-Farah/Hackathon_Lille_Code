@@ -60,7 +60,6 @@
 #define IDLE 0
 #define POWER 1
 #define OVER_VOLTAGE 3
-#define UNDER_VOLTAGE 4
 #define OVER_CURRENT 5
 #define COMMUNICATION_ERROR 6
 
@@ -194,8 +193,6 @@ void loop_communication_task();
 // Only known boards can participate; SM1 generates the arm insertion counts.
 uint8_t module_ID = detect_module_id();
 static float32_t module_command = 0.0F; // 1 = inserted, 0 = bypassed.
-static bool power_requested = false; // SM1: a new 'p' is required after every fault.
-static volatile char requested_command = 0; // Console publishes; control consumes.
 
 // SM1 supplies the two global insertion counts.
 // Protocol change from sine-reference PWM: update all boards together.
@@ -254,7 +251,7 @@ enum serial_interface_menu_mode
     POWERMODE = 1, // Related to connected/disconnected state
 };
 
-serial_interface_menu_mode mode = IDLEMODE;
+volatile serial_interface_menu_mode mode = IDLEMODE;
 
 /* --------------- Distributed insertion variables ------------------*/
 
@@ -280,15 +277,12 @@ static float32_t a = 1; // Modulation dc part, used by SM1
 static float32_t angle;
 static const float32_t w0 = 2 * PI * f0; // Angular frequency
 
-static bool mmc_compute_insertion_counts(float32_t sine, MMC_frame_t &frame)
+static void mmc_compute_insertion_counts(float32_t sine, MMC_frame_t &frame)
 {
     const float32_t upper = 0.5F * (a + m * sine);
     const float32_t lower = 0.5F * (a - m * sine);
-    if (!(upper >= 0.0F && upper <= 1.0F && lower >= 0.0F && lower <= 1.0F))
-        return false;
     frame.upper_insert_count = static_cast<uint8_t>(roundf(total_number_of_modules_arm * upper));
     frame.lower_insert_count = static_cast<uint8_t>(roundf(total_number_of_modules_arm * lower));
-    return true;
 }
 
 /* --------------SETUP FUNCTIONS------------------------------- */
@@ -367,19 +361,13 @@ static bool begin_cycle(const MMC_frame_t &frame)
             communication_fault = COMMUNICATION_ERROR;
         return false;
     }
+    if (frame.status == IDLE) communication_fault = 0;
     if (cycle_started)
     {
         const uint16_t advance = static_cast<uint16_t>(frame.cycle_id - cycle_command.cycle_id);
-        if (advance == 0 || advance >= 32768U) return false;
-        if (frame.status == POWER && advance != 1)
+        if (advance != 1)
             communication_fault = COMMUNICATION_ERROR;
     }
-    if (frame.status == IDLE)
-        communication_fault = 0; // Recovery still requires usable measurements and a new 'p'.
-    if (frame.status > POWER ||
-        frame.upper_insert_count > total_number_of_modules_arm ||
-        frame.lower_insert_count > total_number_of_modules_arm)
-        communication_fault = COMMUNICATION_ERROR;
 
     cycle_command = frame;
     cycle_started = true;
@@ -401,9 +389,7 @@ static bool store_module_measurements(const MMC_frame_t &frame)
     if (!cycle_started || frame.sm_id < MMC_SM_FIRST || frame.sm_id > MMC_SM_LAST)
         return false;
     if (frame.sm_id != MMC_SM1 && !measurement_received[0]) return false;
-    if (frame.cycle_id != cycle_command.cycle_id ||
-        frame.upper_insert_count != cycle_command.upper_insert_count ||
-        frame.lower_insert_count != cycle_command.lower_insert_count)
+    if (frame.cycle_id != cycle_command.cycle_id)
     {
         communication_fault = COMMUNICATION_ERROR;
         return false;
@@ -411,8 +397,9 @@ static bool store_module_measurements(const MMC_frame_t &frame)
     const uint8_t index = frame.sm_id - MMC_SM_FIRST;
     if (measurement_received[index]) return false;
 
-    if (frame.status > POWER) communication_fault = frame.status;
-    else if (frame.status != cycle_command.status) communication_fault = COMMUNICATION_ERROR;
+    if (frame.status == OVER_VOLTAGE || frame.status == OVER_CURRENT ||
+        frame.status == COMMUNICATION_ERROR)
+        communication_fault = frame.status;
     measurement_received[index] = true;
     received_module_count++;
     store_cycle_sample(frame);
@@ -445,6 +432,7 @@ void reception_function()
     if (frame.sm_id == MMC_SM1)
     {
         if (module_ID == MMC_SM1 || !begin_cycle(frame)) return;
+        mode = frame.status == POWER ? POWERMODE : IDLEMODE;
     }
     const bool accepted = store_module_measurements(frame);
     // Bus order: SM1 -> SM2 -> ... -> SM10, across both arms.
@@ -571,14 +559,14 @@ void loop_communication_task()
         /*------------------------------------------------------ */
         break;
     case 'i':
-        requested_command = 'i';
-        printk("idle requested\n");
+        mode = IDLEMODE;
+        printk("idle mode\n");
         break;
     case 'p':
         if (module_ID == MMC_SM1)
         {
-            requested_command = 'p';
-            printk("power requested: waiting for a complete measurement round\n");
+            mode = POWERMODE;
+            printk("power mode\n");
         }
         break;
     case 'r':
@@ -655,28 +643,19 @@ void loop_critical_task()
     update_measurements();
     mmc_check_power_limits();
 
-    const char request = requested_command;
-    requested_command = 0;
-    if (request == 'i')
-    {
-        power_requested = false;
-        if (module_ID != MMC_SM1) communication_fault = COMMUNICATION_ERROR;
-    }
-    if (communication_fault) power_requested = false;
-    else if (module_ID == MMC_SM1 && request == 'p') power_requested = true;
+    if (communication_fault) mode = IDLEMODE;
 
-    // A request starts PWM only after the preceding POWER window is complete.
-    mode = round_complete && cycle_command.status == POWER &&
-        !communication_fault &&
-        (module_ID != MMC_SM1 || power_requested) ? POWERMODE : IDLEMODE;
+    // Apply insertion only once all samples for the POWER cycle are available.
+    const bool apply_power = mode == POWERMODE && round_complete && cycle_command.status == POWER;
     module_command = 0.0F;
-    if (mode == POWERMODE)
+    if (apply_power)
     {
         module_command = mmc_local_insertion();
+        Led_turnON_LL();
     }
     upper_insert_count_scope = cycle_command.upper_insert_count;
     lower_insert_count_scope = cycle_command.lower_insert_count;
-    if (mode == POWERMODE)
+    if (apply_power)
     {
         shield.power.setDutyCycle(LEG2, module_command);
         if (!pwm_enable) shield.power.start(LEG2);
@@ -689,12 +668,12 @@ void loop_critical_task()
         module_command = 0.0F;
     }
 
-    if (module_ID == MMC_SM1 && mode == POWERMODE && ++scope_timer >= scope_period)
+    if (module_ID == MMC_SM1 && apply_power && ++scope_timer >= scope_period)
     {
         scope.acquire();
         scope_timer = 0;
     }
-    if (mode == POWERMODE) critical_task_timer++;
+    if (apply_power) critical_task_timer++;
     counter_timer++;
 
     // Open the next exchange only after consuming the previous window.
@@ -705,17 +684,11 @@ void loop_critical_task()
         next_command = {};
         next_command.sm_id = MMC_SM1;
         next_command.cycle_id = static_cast<uint16_t>(cycle_command.cycle_id + 1U);
-        if (power_requested)
+        if (mode == POWERMODE)
         {
             angle = ot_modulo_2pi(angle + w0 * Ts);
-            if (mmc_compute_insertion_counts(ot_sin(angle), next_command))
-                next_command.status = POWER;
-            else
-            {
-                communication_fault = COMMUNICATION_ERROR;
-                power_requested = false;
-                next_command.status = COMMUNICATION_ERROR;
-            }
+            mmc_compute_insertion_counts(ot_sin(angle), next_command);
+            next_command.status = POWER;
         }
         else angle = 0.0F;
         if (begin_cycle(next_command)) send_own_measurements();
