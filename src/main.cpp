@@ -540,22 +540,22 @@ void setup_routine()
 
     if(module_ID == MMC_SM1)
     {
-        shield.sensors.setConversionParametersLinear(V_HIGH,0.0297809746442154,0.0816717736324648);
-        shield.sensors.setConversionParametersLinear(V1_LOW,0.0447118735275233,-85.4652963581883);
-        shield.sensors.setConversionParametersLinear(V2_LOW,0.044724349440928,-85.9790466977148);
-        shield.sensors.setConversionParametersLinear(I1_LOW,0.00572228696154378,-12.9647582710024);
-        shield.sensors.setConversionParametersLinear(I2_LOW,0.00573807392353278,-12.98795596087);
-        shield.sensors.setConversionParametersLinear(I_HIGH,0.00505978197917605,-9.74527087864709);
+        shield.sensors.setConversionParametersLinear(V_HIGH, 0.0298174F, -0.116135F);
+        shield.sensors.setConversionParametersLinear(I_HIGH, 0.00542287F, -10.9166F);
+        shield.sensors.setConversionParametersLinear(V1_LOW, 0.0452099F, -89.9364F);
+        shield.sensors.setConversionParametersLinear(I1_LOW, 0.0056548F, -11.6536F);
+        shield.sensors.setConversionParametersLinear(V2_LOW, 0.045172F, -88.5664F);
+        shield.sensors.setConversionParametersLinear(I2_LOW, 0.00576626F, -12.6195F);
 
     }
     if(module_ID == MMC_SM6)
     {
-        shield.sensors.setConversionParametersLinear(V_HIGH,0.0297391039983399,0.323800681173033);
-        shield.sensors.setConversionParametersLinear(V1_LOW,0.0449253808069436,-87.8192961435065);
-        shield.sensors.setConversionParametersLinear(V2_LOW,0.0455433243875255,-87.419941665916);
-        shield.sensors.setConversionParametersLinear(I1_LOW,0.00564375060446823,-12.3417089599044);
-        shield.sensors.setConversionParametersLinear(I2_LOW,0.00473940070187198,-10.5860385444491);
-        shield.sensors.setConversionParametersLinear(I_HIGH,0.00523739527489416,-10.2030551937385);
+        shield.sensors.setConversionParametersLinear(V_HIGH, 0.029749F, 0.17888F);
+        shield.sensors.setConversionParametersLinear(I_HIGH, 0.00566004F, -10.9416F);
+        shield.sensors.setConversionParametersLinear(V1_LOW, 0.045442F, -86.4199F);
+        shield.sensors.setConversionParametersLinear(I1_LOW, 0.00569674F, -11.8135F);
+        shield.sensors.setConversionParametersLinear(V2_LOW, 0.0453543F, -86.2705F);
+        shield.sensors.setConversionParametersLinear(I2_LOW, 0.00478794F, -10.687F);
     }
 
     /* Disconnect electrolytical capacitors from low-side */
@@ -613,7 +613,7 @@ void setup_routine()
     }
     shield.power.stop(ALL);
     // Binary insertion uses the same switching phase on every module.
-    shield.power.setPhaseShift(LEG2, 0);
+    shield.power.setPhaseShift(LEG1, 0);
     task.startBackground(background_task_number);
     task.startBackground(CommTask_num);
     task.startCritical();
@@ -820,8 +820,8 @@ void loop_critical_task()
     }
     if (apply_power)
     {
-        shield.power.setDutyCycle(LEG2, module_command);
-        if (!pwm_enable) shield.power.start(LEG2);
+        shield.power.setDutyCycle(LEG1, module_command);
+        if (!pwm_enable) shield.power.start(LEG1);
         pwm_enable = true;
     }
     else
@@ -829,6 +829,10 @@ void loop_critical_task()
         if (pwm_enable) shield.power.stop(ALL);
         pwm_enable = false;
         module_command = 0.0F;
+        if (!module_ID == MMC_SM1)
+        {
+            Led_turnOFF_LL();
+        }
     }
 
     mmc_latch_action();
