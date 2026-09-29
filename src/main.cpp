@@ -76,6 +76,10 @@ constexpr float32_t Vcap_expected = 80.0F; //[V] Capacitor DC voltage expected d
 constexpr float32_t i_expected = 10.0F; //[A] Expected current amplitude during test (used to set current measurement scale for 12 bits)
 constexpr float32_t overvoltage_tolerance = 80.0F; //[V] Set overvoltage tolerance (default max TWIST voltage)
 constexpr float32_t overcurrent_tolerance = 8.0F; //[A] Set overcurrent tolerance (default max TWIST current)
+constexpr uint8_t debug_module_id = MMC_SM2; // Peer compared with SM1 in ScopeMimicry.
+static_assert(debug_module_id >= MMC_SM2 && debug_module_id <= MMC_SM_LAST,
+              "Select a debug peer from SM2 to SM10");
+constexpr uint8_t ACTION_UNAVAILABLE = 255;
 
 /* -------------- BOARD IDENTIFICATION ----------------------- */
 /* --------------- To be changed by user --------------------- */
@@ -195,7 +199,7 @@ uint8_t module_ID = detect_module_id();
 static float32_t module_command = 0.0F; // 1 = inserted, 0 = bypassed.
 
 // SM1 supplies the two global insertion counts.
-// Protocol change from sine-reference PWM: update all boards together.
+// 12-byte debug protocol: update all ten boards together.
 struct MMC_frame_t
 {
     uint8_t upper_insert_count;
@@ -205,7 +209,12 @@ struct MMC_frame_t
     uint16_t arm_current_raw : 12;
     uint8_t status;
     uint8_t sm_id;
+    // Only bit (sm_id - 1) belongs to this sender; bits 10..15 are zero.
+    // Frame C reports the software action applied for C-1, not sensed gate state.
+    uint16_t previous_inserted_mask;
+    uint8_t previous_status; // Applied POWER/IDLE/fault, or ACTION_UNAVAILABLE.
 } __packed;
+static_assert(sizeof(MMC_frame_t) == 12, "All modules must use the same 12-byte frame");
 
 static bool mmc_is_upper_arm_module(uint8_t id)
 {
@@ -216,11 +225,18 @@ static bool mmc_is_upper_arm_module(uint8_t id)
 static uint16_t capacitor_voltage_raw[MMC_SM_COUNT] = {};
 static bool measurement_received[MMC_SM_COUNT] = {};
 static uint8_t received_module_count = 0;
+static uint16_t arm_current_raw[MMC_SM_COUNT] = {};
+static uint8_t module_status[MMC_SM_COUNT] = {};
+static uint8_t module_previous_status[MMC_SM_COUNT] = {};
+static uint16_t previous_inserted_mask = 0;
+static uint16_t action_valid_mask = 0;
+static uint16_t previous_action_cycle_id = 0;
+static bool previous_action_valid = false;
+static uint8_t previous_action_status = ACTION_UNAVAILABLE;
+static bool previous_action_inserted = false;
 // SM1 supplies the upper-arm current; SM6 supplies the lower-arm current.
 static float32_t upper_arm_current_reference = 0.0F;
 static float32_t lower_arm_current_reference = 0.0F;
-static float32_t upper_insert_count_scope = 0.0F;
-static float32_t lower_insert_count_scope = 0.0F;
 
 // Scheduling assumption: RS485 reception and control never overlap.
 // Each exchange finishes before the next control tick; no interrupt locking.
@@ -264,10 +280,39 @@ static bool pwm_enable = false;
 static uint32_t critical_task_timer = 0; 
 
 /* Scope variables */
+// On SM1: p arms automatic fault capture; s rearms a frozen trace (also arms
+// faults); a triggers manually; i then r exports once acquisition is frozen.
+// 24 float channels x 512 points = 49,152 bytes, below the library's 64 KiB limit.
+// At each row C, vc/i/status and N_* describe exchange C. *_prev describes
+// the action for C-1: compare it with N_*/vc/i from row C-1. `inserted` is the
+// new SM1 action for C. The peer is selected by debug_module_id above.
+// Mask bit 0 = SM1, ... bit 9 = SM10. rx_mask includes SM1's own transmission.
+// A zero insertion bit means bypass/stopped ONLY if action_valid_mask has that
+// bit set. Missing measurements/actions are NaN in the self/peer channels.
+// prev_status: 0 stopped, 1 PWM enabled (inserted OR bypass), 3/5/6 fault.
+// fault_mask identifies frames REPORTING faults; propagated faults need not
+// originate in the reporting module. `fault` is SM1's current local/received fault.
 static bool enable_acq; // Sets trigger moment if true
-static const uint16_t NB_DATAS = 1028; // Number of data acquired
-static ScopeMimicry scope(NB_DATAS, 5); // Voltage, arm counts, shared current and insertion
-static bool is_downloading; // Records data if true
+static const uint16_t NB_DATAS = 512; // 102.4 ms at 200 us/sample.
+static constexpr uint16_t SCOPE_CHANNELS = 24;
+static_assert(NB_DATAS * SCOPE_CHANNELS * sizeof(float32_t) <= UINT16_MAX,
+              "ScopeMimicry exports its buffer size as uint16_t");
+static ScopeMimicry scope(NB_DATAS, SCOPE_CHANNELS);
+struct DebugScopeData
+{
+    float32_t cycle_id, N_upper, N_lower, i_upper_ref, i_lower_ref;
+    float32_t inserted_prev_mask, rx_mask, action_valid_mask, fault_mask, fault, mode, debug_sm;
+    float32_t vc_self, vc_peer, i_self, i_peer, status_self, status_peer;
+    float32_t prev_status_self, prev_status_peer, inserted_self_prev, inserted_peer_prev;
+    float32_t inserted, rx_count;
+};
+static DebugScopeData debug_scope = {};
+static bool scope_ready = false;
+static bool scope_fault_armed = false; // Arm with p or s; ignore startup bus faults.
+static bool scope_fault_triggered = false;
+static bool scope_rearm_requested = false;
+static uint16_t scope_samples_recorded = 0; // Exclude pre-rearm history from export.
+static bool is_downloading; // Export requested; keep the buffer frozen until done.
 static uint32_t scope_timer = 0;
 static uint32_t scope_period = 1; // scope acquire data every t = scope_period * critical_task_period (200 µs) s;
 
@@ -310,7 +355,7 @@ inline void Led_turnOFF_LL()
 /* Trigger function for scope manager */
 bool a_trigger()
 {
-    return enable_acq;
+    return enable_acq || scope_fault_triggered;
 }
 
 /* Records scope data */
@@ -329,7 +374,12 @@ void dump_scope_datas(ScopeMimicry &scope)
     printk("# %d\n", scope.get_final_idx());
     for (uint16_t k = 0; k < buffer_size; k++)
     {
-        printk("%08x\n", *((uint32_t *)buffer + k));
+        const uint16_t sample_index = k / scope.get_nb_channel();
+        const uint16_t age = (scope.get_final_idx() + scope.get_length() - sample_index) % scope.get_length();
+        // start() keeps the library's old ring contents. Mark history that was
+        // not acquired since rearm as NaN, including an early startup trigger.
+        const uint32_t value = age < scope_samples_recorded ? *((uint32_t *)buffer + k) : 0x7FC00000U;
+        printk("%08x\n", value);
         task.suspendBackgroundUs(100);
     }
     printk("end record\n");
@@ -376,7 +426,20 @@ static bool begin_cycle(const MMC_frame_t &frame)
 
 static void store_cycle_sample(const MMC_frame_t &frame)
 {
-    capacitor_voltage_raw[frame.sm_id - MMC_SM_FIRST] = frame.capacitor_voltage_raw;
+    const uint8_t index = frame.sm_id - MMC_SM_FIRST;
+    const uint16_t bit = static_cast<uint16_t>(1U << index);
+    capacitor_voltage_raw[index] = frame.capacitor_voltage_raw;
+    arm_current_raw[index] = frame.arm_current_raw;
+    module_status[index] = frame.status;
+    module_previous_status[index] = frame.previous_status;
+    // Never trust a sender's copy of another module's action.
+    previous_inserted_mask &= static_cast<uint16_t>(~bit);
+    action_valid_mask &= static_cast<uint16_t>(~bit);
+    if (frame.previous_status != ACTION_UNAVAILABLE)
+    {
+        previous_inserted_mask |= frame.previous_inserted_mask & bit;
+        action_valid_mask |= bit;
+    }
     const float32_t current = Arm_current_SCALE * static_cast<float32_t>(frame.arm_current_raw) / 4095.0F
         - Arm_current_OFFSET;
     if (frame.sm_id == MMC_SM1) upper_arm_current_reference = current;
@@ -416,6 +479,11 @@ static void send_own_measurements()
     frame.capacitor_voltage_raw = mmc_encode_voltage(Cap_voltage);
     frame.arm_current_raw = mmc_encode_current(Arm_current);
     if (communication_fault) frame.status = communication_fault;
+    const bool action_is_previous = previous_action_valid &&
+        static_cast<uint16_t>(previous_action_cycle_id + 1U) == frame.cycle_id;
+    frame.previous_status = action_is_previous ? previous_action_status : ACTION_UNAVAILABLE;
+    frame.previous_inserted_mask = action_is_previous && previous_action_inserted ?
+        static_cast<uint16_t>(1U << index) : 0;
     store_cycle_sample(frame);
     // Include our own slot in the round without waiting for an echo.
     measurement_received[index] = true;
@@ -510,13 +578,32 @@ void setup_routine()
         communication.sync.initMaster();
 
         /* Configures scopemimicry measured variables */
-        scope.connectChannel(Cap_voltage, "vc_self");
-        scope.connectChannel(upper_insert_count_scope, "N_upper");
-        scope.connectChannel(lower_insert_count_scope, "N_lower");
-        scope.connectChannel(upper_arm_current_reference, "i_upper_ref");
-        scope.connectChannel(module_command, "inserted");
+        scope.connectChannel(debug_scope.cycle_id, "cycle_id");
+        scope.connectChannel(debug_scope.N_upper, "N_upper");
+        scope.connectChannel(debug_scope.N_lower, "N_lower");
+        scope.connectChannel(debug_scope.i_upper_ref, "i_upper_ref");
+        scope.connectChannel(debug_scope.i_lower_ref, "i_lower_ref");
+        scope.connectChannel(debug_scope.inserted_prev_mask, "inserted_prev_mask");
+        scope.connectChannel(debug_scope.rx_mask, "rx_mask");
+        scope.connectChannel(debug_scope.action_valid_mask, "action_valid_mask");
+        scope.connectChannel(debug_scope.fault_mask, "fault_mask");
+        scope.connectChannel(debug_scope.fault, "fault");
+        scope.connectChannel(debug_scope.mode, "mode");
+        scope.connectChannel(debug_scope.debug_sm, "debug_sm");
+        scope.connectChannel(debug_scope.vc_self, "vc_self");
+        scope.connectChannel(debug_scope.vc_peer, "vc_peer");
+        scope.connectChannel(debug_scope.i_self, "i_self");
+        scope.connectChannel(debug_scope.i_peer, "i_peer");
+        scope.connectChannel(debug_scope.status_self, "status_self");
+        scope.connectChannel(debug_scope.status_peer, "status_peer");
+        scope.connectChannel(debug_scope.prev_status_self, "prev_status_self");
+        scope.connectChannel(debug_scope.prev_status_peer, "prev_status_peer");
+        scope.connectChannel(debug_scope.inserted_self_prev, "inserted_self_prev");
+        scope.connectChannel(debug_scope.inserted_peer_prev, "inserted_peer_prev");
+        scope.connectChannel(debug_scope.inserted, "inserted");
+        scope.connectChannel(debug_scope.rx_count, "rx_count");
         scope.set_trigger(&a_trigger);
-        scope.set_delay(0.0F);
+        scope.set_delay(0.75F); // About 75% history, 25% after manual/fault trigger.
         scope.start();
 
     }
@@ -539,7 +626,7 @@ void setup_routine()
  * It is used to send to the board via the computer the desired mode
  * IDLE (i) = block all modules or POWER (p) = operate with distributed capacitor-voltage sorting.
  * 
- * It also sends data acquisition start command (a) and scope data retrieve commands (r).
+ * Scope: s rearms, a triggers, r triggers and retrieves once frozen in IDLE.
  */
 void loop_communication_task()
 {
@@ -553,8 +640,9 @@ void loop_communication_task()
                "|     ---- MENU buck voltage mode ----   |\n"
                "|     press i : idle mode                |\n"
                "|     press p : power mode               |\n"
-               "|     press r : record data              |\n"
-               "|     press a : toggle enable_acq var    |\n"
+               "|     press r : freeze/export in idle    |\n"
+               "|     press a : trigger scope            |\n"
+               "|     press s : rearm scope              |\n"
                "|________________________________________|\n\n");
         /*------------------------------------------------------ */
         break;
@@ -566,14 +654,22 @@ void loop_communication_task()
         if (module_ID == MMC_SM1)
         {
             mode = POWERMODE;
+            scope_fault_armed = true;
             printk("power mode\n");
         }
         break;
     case 'r':
-        is_downloading = true;
+        if (module_ID == MMC_SM1)
+        {
+            enable_acq = true;
+            is_downloading = true;
+        }
         break;
     case 'a':
-        enable_acq = !(enable_acq);
+        if (module_ID == MMC_SM1) enable_acq = true;
+        break;
+    case 's':
+        if (module_ID == MMC_SM1 && !is_downloading) scope_rearm_requested = true;
         break;
     default:
         break;
@@ -593,7 +689,7 @@ void loop_background_task()
         if (mode == IDLEMODE)
         {
             spin.led.turnOff();
-            if (is_downloading)
+            if (is_downloading && scope_ready)
             {
                 dump_scope_datas(scope);
                 is_downloading = false;
@@ -626,6 +722,61 @@ static float32_t mmc_local_insertion()
     return rank < count ? 1.0F : 0.0F;
 }
 
+// Latch the software action AFTER the PWM calls, for the next exchange.
+static void mmc_latch_action()
+{
+    previous_action_valid = cycle_started;
+    previous_action_cycle_id = cycle_command.cycle_id;
+    previous_action_status = communication_fault ? communication_fault : (pwm_enable ? POWER : IDLE);
+    previous_action_inserted = pwm_enable && module_command == 1.0F;
+}
+
+// One coherent snapshot of the consumed exchange, before reception flags reset.
+static void mmc_update_debug_scope()
+{
+    uint16_t received_mask = 0;
+    uint16_t fault_mask = 0;
+    for (uint8_t index = 0; index < MMC_SM_COUNT; ++index)
+    {
+        if (!measurement_received[index]) continue;
+        const uint16_t bit = static_cast<uint16_t>(1U << index);
+        received_mask |= bit;
+        const uint8_t status = module_status[index];
+        if (status == OVER_VOLTAGE || status == OVER_CURRENT || status == COMMUNICATION_ERROR)
+            fault_mask |= bit;
+    }
+    const uint8_t peer = debug_module_id - MMC_SM_FIRST;
+    const bool self_received = measurement_received[0];
+    const bool peer_received = measurement_received[peer];
+    const uint16_t valid_actions = action_valid_mask & received_mask;
+    const bool self_action_valid = (valid_actions & 1U) != 0;
+    const bool peer_action_valid = (valid_actions & (1U << peer)) != 0;
+    debug_scope.cycle_id = cycle_started ? cycle_command.cycle_id : NAN;
+    debug_scope.N_upper = self_received ? cycle_command.upper_insert_count : NAN;
+    debug_scope.N_lower = self_received ? cycle_command.lower_insert_count : NAN;
+    debug_scope.i_upper_ref = self_received ? upper_arm_current_reference : NAN;
+    debug_scope.i_lower_ref = measurement_received[MMC_SM6 - MMC_SM_FIRST] ? lower_arm_current_reference : NAN;
+    debug_scope.inserted_prev_mask = previous_inserted_mask & valid_actions;
+    debug_scope.rx_mask = received_mask;
+    debug_scope.action_valid_mask = valid_actions;
+    debug_scope.fault_mask = fault_mask;
+    debug_scope.fault = communication_fault;
+    debug_scope.mode = mode;
+    debug_scope.debug_sm = debug_module_id;
+    debug_scope.vc_self = self_received ? mmc_decode_voltage(capacitor_voltage_raw[0]) : NAN;
+    debug_scope.vc_peer = peer_received ? mmc_decode_voltage(capacitor_voltage_raw[peer]) : NAN;
+    debug_scope.i_self = self_received ? Arm_current_SCALE * arm_current_raw[0] / 4095.0F - Arm_current_OFFSET : NAN;
+    debug_scope.i_peer = peer_received ? Arm_current_SCALE * arm_current_raw[peer] / 4095.0F - Arm_current_OFFSET : NAN;
+    debug_scope.status_self = self_received ? module_status[0] : NAN;
+    debug_scope.status_peer = peer_received ? module_status[peer] : NAN;
+    debug_scope.prev_status_self = self_action_valid ? module_previous_status[0] : NAN;
+    debug_scope.prev_status_peer = peer_action_valid ? module_previous_status[peer] : NAN;
+    debug_scope.inserted_self_prev = self_action_valid ? ((previous_inserted_mask & 1U) ? 1.0F : 0.0F) : NAN;
+    debug_scope.inserted_peer_prev = peer_action_valid ? ((previous_inserted_mask & (1U << peer)) ? 1.0F : 0.0F) : NAN;
+    debug_scope.inserted = module_command;
+    debug_scope.rx_count = received_module_count;
+}
+
 /**
  * This is the code loop of the critical task
  * It is executed every 200 micro-seconds defined in the setup_software
@@ -636,6 +787,20 @@ static float32_t mmc_local_insertion()
  */
 void loop_critical_task()
 {
+    if (module_ID == MMC_SM1 && scope_rearm_requested)
+    {
+        if (!is_downloading)
+        {
+            scope.start();
+            scope_ready = false;
+            enable_acq = false;
+            scope_fault_triggered = false;
+            scope_fault_armed = true;
+            scope_timer = 0;
+            scope_samples_recorded = 0;
+        }
+        scope_rearm_requested = false;
+    }
     // The preceding exchange is finished before control starts.
     const bool round_complete = received_module_count == MMC_SM_COUNT;
     if (cycle_started && !round_complete)
@@ -653,8 +818,6 @@ void loop_critical_task()
         module_command = mmc_local_insertion();
         Led_turnON_LL();
     }
-    upper_insert_count_scope = cycle_command.upper_insert_count;
-    lower_insert_count_scope = cycle_command.lower_insert_count;
     if (apply_power)
     {
         shield.power.setDutyCycle(LEG2, module_command);
@@ -668,16 +831,25 @@ void loop_critical_task()
         module_command = 0.0F;
     }
 
-    if (module_ID == MMC_SM1 && apply_power && ++scope_timer >= scope_period)
+    mmc_latch_action();
+    if (module_ID == MMC_SM1 && !scope_ready)
     {
-        scope.acquire();
-        scope_timer = 0;
+        if (scope_fault_armed && communication_fault) scope_fault_triggered = true;
+        if (++scope_timer >= scope_period)
+        {
+            mmc_update_debug_scope();
+            scope_ready = scope.acquire() == 2; // Library returns 2 once frozen.
+            if (!scope_ready && scope_samples_recorded < NB_DATAS) ++scope_samples_recorded;
+            scope_timer = 0;
+        }
     }
     if (apply_power) critical_task_timer++;
     counter_timer++;
 
     // Open the next exchange only after consuming the previous window.
     received_module_count = 0;
+    previous_inserted_mask = 0;
+    action_valid_mask = 0;
     for (uint8_t i = 0; i < MMC_SM_COUNT; ++i) measurement_received[i] = false;
     if (module_ID == MMC_SM1)
     {
