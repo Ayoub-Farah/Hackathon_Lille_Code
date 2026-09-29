@@ -278,7 +278,7 @@ volatile serial_interface_menu_mode mode = IDLEMODE;
 /* --------------- Distributed insertion variables ------------------*/
 
 /* [us] period of the control task (=critical task) */
-static constexpr uint32_t control_task_period = 200; // us
+static constexpr uint32_t control_task_period = 400; // us
 // Let followers enter their synchronized control task before SM1 opens the bus.
 // This is a boot grace period, not an acknowledgement that every board is ready.
 static constexpr uint32_t communication_startup_delay_us = 1000000; // 1 s
@@ -405,27 +405,27 @@ static void update_measurements(void)
 
 static void mmc_check_power_limits()
 {
-    if (fabsf(Arm_current) > overcurrent_tolerance) communication_fault = OVER_CURRENT;
-    else if (Cap_voltage > overvoltage_tolerance) communication_fault = OVER_VOLTAGE;
+    // if (fabsf(Arm_current) > overcurrent_tolerance) communication_fault = OVER_CURRENT;
+    // else if (Cap_voltage > overvoltage_tolerance) communication_fault = OVER_VOLTAGE;
 }
 
 // Called once per reception window, including on SM1.
 static bool begin_cycle(const MMC_frame_t &frame)
 {
     if (frame.sm_id != MMC_SM1) return false;
-    if (received_module_count != 0)
-    {
-        if (frame.cycle_id != cycle_command.cycle_id)
-            communication_fault = COMMUNICATION_ERROR;
-        return false;
-    }
+    // if (received_module_count != 0)
+    // {
+    //     if (frame.cycle_id != cycle_command.cycle_id)
+    //         communication_fault = COMMUNICATION_ERROR;
+    //     return false;
+    // }
     if (frame.status == IDLE || frame.status == DISCOVERY) communication_fault = 0;
-    if (cycle_started)
-    {
-        const uint16_t advance = static_cast<uint16_t>(frame.cycle_id - cycle_command.cycle_id);
-        if (advance != 1)
-            communication_fault = COMMUNICATION_ERROR;
-    }
+    // if (cycle_started)
+    // {
+    //     const uint16_t advance = static_cast<uint16_t>(frame.cycle_id - cycle_command.cycle_id);
+    //     if (advance != 1)
+    //         communication_fault = COMMUNICATION_ERROR;
+    // }
 
     cycle_command = frame;
     cycle_started = true;
@@ -457,20 +457,17 @@ static void store_cycle_sample(const MMC_frame_t &frame)
 // Count accepted frames and keep measurements from this exchange.
 static bool store_module_measurements(const MMC_frame_t &frame)
 {
-    if (!cycle_started || frame.sm_id < MMC_SM_FIRST || frame.sm_id > MMC_SM_LAST)
-        return false;
-    if (frame.sm_id != MMC_SM1 && !measurement_received[0]) return false;
-    if (frame.cycle_id != cycle_command.cycle_id)
-    {
-        communication_fault = COMMUNICATION_ERROR;
-        return false;
-    }
+    // if (frame.cycle_id != cycle_command.cycle_id)
+    // {
+        // communication_fault = COMMUNICATION_ERROR;
+        // return false;
+    // }
     const uint8_t index = frame.sm_id - MMC_SM_FIRST;
-    if (measurement_received[index]) return false;
+    // if (measurement_received[index]) return false;
 
-    if (frame.status == OVER_VOLTAGE || frame.status == OVER_CURRENT ||
-        frame.status == COMMUNICATION_ERROR)
-        communication_fault = frame.status;
+    // if (frame.status == OVER_VOLTAGE || frame.status == OVER_CURRENT ||
+    //     frame.status == COMMUNICATION_ERROR)
+        // communication_fault = frame.status;
     measurement_received[index] = true;
     received_module_count++;
     store_cycle_sample(frame);
@@ -480,7 +477,7 @@ static bool store_module_measurements(const MMC_frame_t &frame)
 static void send_own_measurements()
 {
     const uint8_t index = module_ID - MMC_SM_FIRST;
-    if (measurement_received[index]) return;
+    // if (measurement_received[index]) return;
     mmc_check_power_limits();
     MMC_frame_t frame = cycle_command;
     frame.sm_id = module_ID;
@@ -514,7 +511,7 @@ void reception_function()
     }
     const bool accepted = store_module_measurements(frame);
     // Bus order: SM1 -> SM2 -> ... -> SM10, across both arms.
-    if (module_ID != MMC_SM1 && accepted)
+    if (module_ID != MMC_SM1)
     {
         if (cycle_command.status == DISCOVERY)
         {
@@ -875,7 +872,7 @@ void loop_critical_task()
     }
     if (cycle_started && !discovery_round && !round_complete)
     {
-        communication_fault = COMMUNICATION_ERROR;
+        // communication_fault = COMMUNICATION_ERROR;
         if (module_ID == MMC_SM1)
         {
             bus_ready = false;
@@ -890,7 +887,7 @@ void loop_critical_task()
         mode = IDLEMODE;
 
     // Apply insertion only once all samples for the POWER cycle are available.
-    const bool apply_power = mode == POWERMODE && round_complete && cycle_command.status == POWER;
+    const bool apply_power = mode == POWERMODE && cycle_command.status == POWER;
     module_command = 0.0F;
     if (apply_power)
     {

@@ -1,0 +1,68 @@
+// Vue synthétique des appels principaux de src/main.cpp.
+// Rendu : dot -Tsvg docs/main_calls_simple.dot -o docs/main_calls_simple.svg
+digraph main_calls_simple {
+    graph [label="MMC — principaux appels de fonctions", labelloc=t,
+           fontname="Arial", fontsize=22, rankdir=LR, bgcolor="white",
+           nodesep=0.35, ranksep=0.65, pad=0.3];
+    node [shape=box, style="rounded,filled", fillcolor="#F1F5F9",
+          color="#94A3B8", fontname="Arial", fontsize=11, margin="0.16,0.12"];
+    edge [color="#475569", fontname="Arial", fontsize=10, arrowsize=0.7];
+
+    main [label="main()"];
+    setup [label="setup_routine()\nInitialiser matériel, capteurs, synchronisation,\nRS485 et tâches (si carte reconnue)"];
+    main -> setup;
+
+    subgraph cluster_control {
+        label="Contrôle périodique — toutes les 200 µs";
+        fontname="Arial"; color="#93C5FD"; style=rounded;
+        critical [label="loop_critical_task()", fillcolor="#DBEAFE"];
+        measure [label="update_measurements()\nmmc_check_power_limits()\nLire les capteurs et vérifier les limites"];
+        insertion [label="mmc_local_insertion()\nDécider l'insertion du module"];
+        power [label="shield.power.setDutyCycle() / start() / stop()\nAppliquer la commande ou arrêter"];
+        scope [label="scope.acquire()\nAcquérir les données", fillcolor="#FFEDD5"];
+        counts [label="mmc_compute_insertion_counts()\nCalculer les nombres d'insertion du prochain tour", fillcolor="#FFEDD5"];
+        critical -> measure [label="1"];
+        critical -> insertion [label="2 · POWER et tour complet"];
+        critical -> power [label="3"];
+        critical -> scope [label="4 · SM1, POWER"];
+        critical -> counts [label="5 · SM1, mode POWER"];
+    }
+
+    subgraph cluster_rs485 {
+        label="Échanges RS485 — SM1 → SM2 → … → SM10";
+        fontname="Arial"; color="#C4B5FD"; style=rounded;
+        reception [label="reception_function()\nCallback de réception", fillcolor="#EDE9FE"];
+        begin [label="begin_cycle()\nOuvrir le tour de communication"];
+        store [label="store_module_measurements()\nValider et mémoriser les mesures reçues"];
+        send [label="send_own_measurements()\nVérifier les limites, coder et mémoriser\nses mesures, puis les envoyer"];
+        transmit [label="communication.rs485.startTransmission()"];
+        reception -> begin [label="1 · trame SM1 reçue par un esclave"];
+        reception -> store [label="2 · trame à traiter"];
+        reception -> send [label="3 · après le prédécesseur accepté"];
+        send -> transmit;
+    }
+
+    subgraph cluster_auxiliary {
+        label="Tâches auxiliaires";
+        fontname="Arial"; color="#CBD5E1"; style=rounded;
+        console [label="loop_communication_task()"];
+        getchar [label="console_getchar()\nLire les commandes : mode et acquisition"];
+        background [label="loop_background_task()\nGérer les LED et l'export sur SM1"];
+        dump [label="dump_scope_datas()\nExporter l'acquisition"];
+        console -> getchar;
+        background -> dump [label="SM1 · IDLE et export demandé"];
+    }
+
+    critical -> begin [label="6 · SM1"];
+    critical -> send [label="7 · SM1, si tour ouvert"];
+
+    // Les tâches/callbacks sont enregistrés puis exécutés par le runtime.
+    edge [style=dashed, color="#7C3AED", fontcolor="#6D28D9"];
+    setup -> critical [label="tâche périodique"];
+    setup -> reception [label="callback RS485"];
+    setup -> console [label="tâche console"];
+    setup -> background [label="tâche de fond"];
+
+    legend [shape=note, fillcolor="white", fontsize=10,
+            label="Trait plein : appel direct (appels secondaires regroupés).\lPointillés : enregistrement / activation d'une tâche ou d'un callback.\lOrange : appel réservé à SM1.\lLes numéros indiquent l'ordre dans chaque fonction.\lConditions et helpers secondaires omis.\l"];
+}

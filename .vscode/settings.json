@@ -1,14 +1,15 @@
 {
   "files.exclude": {
-    ".pio": true,
-    ".vscode": true,
-    "owntech": true,
-    "zephyr": true,
-    ".gitignore": true,
-    "docs": true,
-    ".github": true
+    ".pio": false,
+    ".vscode": false,
+    "owntech": false,
+    "zephyr": false,
+    ".gitignore": false,
+    "docs": false,
+    ".github": false
   },
   "files.associations": {
     "cmath": "cpp"
-  }
+  },
+  "cmake.sourceDirectory": "C:/Users/afarahhass/Documents/Repo/CoreV2/Core_Ana/zephyr"
 }
