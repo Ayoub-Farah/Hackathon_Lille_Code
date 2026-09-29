@@ -292,9 +292,9 @@ static bool pwm_enable = false;
 static uint32_t critical_task_timer = 0; 
 
 /* Scope variables */
-// Linear capture on SM1: p starts a new run from IDLE; a/s restart capture.
-// i, r, a fault or a full buffer freeze the trace. r exports in IDLE.
-// Only main.cpp writes samples, from index 0 onward: no circular acquisition.
+// Circular capture on SM1: p starts a new run from IDLE; a/s restart capture.
+// i, r or a fault freeze the trace, including the triggering sample.
+// A full buffer keeps the latest 512 samples; r exports in chronological order in IDLE.
 // 24 float channels x 512 points = 49,152 bytes, below the library's 64 KiB limit.
 // At each row C, vc/i/status and N_* describe exchange C. *_prev describes
 // the action for C-1: compare it with N_*/vc/i from row C-1. `inserted` is the
@@ -326,6 +326,7 @@ static bool scope_active = false;
 static bool scope_stop_requested = false;
 static bool scope_rearm_requested = false;
 static uint16_t scope_samples_recorded = 0;
+static uint16_t scope_write_index = 0; // Next slot; oldest sample when full.
 static bool is_downloading; // Export requested; keep the buffer frozen until done.
 static uint32_t scope_timer = 0;
 static uint32_t scope_period = 1; // scope acquire data every t = scope_period * critical_task_period (200 µs) s;
@@ -379,10 +380,13 @@ void dump_scope_datas(ScopeMimicry &scope)
     }
     printk("\n");
     printk("# -1\n"); // Already chronological: readers must not rotate rows.
+    const uint16_t first_sample = scope_samples_recorded == NB_DATAS ? scope_write_index : 0;
     for (uint16_t k = 0; k < buffer_size; k++)
     {
+        const uint16_t sample = (first_sample + k / scope.get_nb_channel()) % NB_DATAS;
+        const uint16_t channel = k % scope.get_nb_channel();
         uint32_t value;
-        memcpy(&value, buffer + k * sizeof(value), sizeof(value));
+        memcpy(&value, buffer + (sample * scope.get_nb_channel() + channel) * sizeof(value), sizeof(value));
         printk("%08x\n", value);
         task.suspendBackgroundUs(100);
     }
@@ -655,8 +659,8 @@ void loop_communication_task()
                "|     press i : idle mode                |\n"
                "|     press p : power mode               |\n"
                "|     press r : freeze/export in idle    |\n"
-               "|     press a : restart linear capture   |\n"
-               "|     press s : restart linear capture   |\n"
+               "|     press a : restart circular capture |\n"
+               "|     press s : restart circular capture |\n"
                "|________________________________________|\n\n");
         /*------------------------------------------------------ */
         break;
@@ -849,6 +853,7 @@ void loop_critical_task()
             scope_active = true;
             scope_timer = 0;
             scope_samples_recorded = 0;
+            scope_write_index = 0;
         }
         scope_rearm_requested = false;
     }
@@ -916,15 +921,13 @@ void loop_critical_task()
         if (++scope_timer >= scope_period || stop_capture)
         {
             mmc_update_debug_scope();
-            if (scope_samples_recorded < NB_DATAS)
-            {
-                memcpy(scope.get_buffer() + scope_samples_recorded * sizeof(DebugScopeData),
-                       &debug_scope, sizeof(debug_scope));
-                ++scope_samples_recorded;
-            }
+            memcpy(scope.get_buffer() + scope_write_index * sizeof(DebugScopeData),
+                   &debug_scope, sizeof(debug_scope));
+            scope_write_index = (scope_write_index + 1) % NB_DATAS;
+            if (scope_samples_recorded < NB_DATAS) ++scope_samples_recorded;
             scope_timer = 0;
         }
-        if (stop_capture || scope_samples_recorded == NB_DATAS)
+        if (stop_capture)
         {
             scope_active = false;
             scope_ready = true;
