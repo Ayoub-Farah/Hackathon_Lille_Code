@@ -280,8 +280,9 @@ static bool pwm_enable = false;
 static uint32_t critical_task_timer = 0; 
 
 /* Scope variables */
-// On SM1: p arms automatic fault capture; s rearms a frozen trace (also arms
-// faults); a triggers manually; i then r exports once acquisition is frozen.
+// Linear capture on SM1: p starts a new run from IDLE; a/s restart capture.
+// i, r, a fault or a full buffer freeze the trace. r exports in IDLE.
+// Only main.cpp writes samples, from index 0 onward: no circular acquisition.
 // 24 float channels x 512 points = 49,152 bytes, below the library's 64 KiB limit.
 // At each row C, vc/i/status and N_* describe exchange C. *_prev describes
 // the action for C-1: compare it with N_*/vc/i from row C-1. `inserted` is the
@@ -292,7 +293,6 @@ static uint32_t critical_task_timer = 0;
 // prev_status: 0 stopped, 1 PWM enabled (inserted OR bypass), 3/5/6 fault.
 // fault_mask identifies frames REPORTING faults; propagated faults need not
 // originate in the reporting module. `fault` is SM1's current local/received fault.
-static bool enable_acq; // Sets trigger moment if true
 static const uint16_t NB_DATAS = 512; // 102.4 ms at 200 us/sample.
 static constexpr uint16_t SCOPE_CHANNELS = 24;
 static_assert(NB_DATAS * SCOPE_CHANNELS * sizeof(float32_t) <= UINT16_MAX,
@@ -307,11 +307,13 @@ struct DebugScopeData
     float32_t inserted, rx_count;
 };
 static DebugScopeData debug_scope = {};
-static bool scope_ready = false;
-static bool scope_fault_armed = false; // Arm with p or s; ignore startup bus faults.
-static bool scope_fault_triggered = false;
+static_assert(sizeof(DebugScopeData) == SCOPE_CHANNELS * sizeof(float32_t),
+              "Debug fields must match the connected channel order");
+static bool scope_ready = true;
+static bool scope_active = false;
+static bool scope_stop_requested = false;
 static bool scope_rearm_requested = false;
-static uint16_t scope_samples_recorded = 0; // Exclude pre-rearm history from export.
+static uint16_t scope_samples_recorded = 0;
 static bool is_downloading; // Export requested; keep the buffer frozen until done.
 static uint32_t scope_timer = 0;
 static uint32_t scope_period = 1; // scope acquire data every t = scope_period * critical_task_period (200 µs) s;
@@ -352,18 +354,11 @@ inline void Led_turnOFF_LL()
     LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_5);
 }
 
-/* Trigger function for scope manager */
-bool a_trigger()
-{
-    return enable_acq || scope_fault_triggered;
-}
-
 /* Records scope data */
 void dump_scope_datas(ScopeMimicry &scope)
 {
     uint8_t *buffer = scope.get_buffer();
-    /* We divide by 4 (4 bytes per float32_t value) */
-    uint16_t buffer_size = scope.get_buffer_size() >> 2;
+    const uint16_t buffer_size = scope_samples_recorded * scope.get_nb_channel();
     printk("begin record\n");
     printk("#");
     for (uint16_t k = 0; k < scope.get_nb_channel(); k++)
@@ -371,14 +366,11 @@ void dump_scope_datas(ScopeMimicry &scope)
         printk("%s,", scope.get_channel_name(k));
     }
     printk("\n");
-    printk("# %d\n", scope.get_final_idx());
+    printk("# -1\n"); // Already chronological: readers must not rotate rows.
     for (uint16_t k = 0; k < buffer_size; k++)
     {
-        const uint16_t sample_index = k / scope.get_nb_channel();
-        const uint16_t age = (scope.get_final_idx() + scope.get_length() - sample_index) % scope.get_length();
-        // start() keeps the library's old ring contents. Mark history that was
-        // not acquired since rearm as NaN, including an early startup trigger.
-        const uint32_t value = age < scope_samples_recorded ? *((uint32_t *)buffer + k) : 0x7FC00000U;
+        uint32_t value;
+        memcpy(&value, buffer + k * sizeof(value), sizeof(value));
         printk("%08x\n", value);
         task.suspendBackgroundUs(100);
     }
@@ -602,9 +594,8 @@ void setup_routine()
         scope.connectChannel(debug_scope.inserted_peer_prev, "inserted_peer_prev");
         scope.connectChannel(debug_scope.inserted, "inserted");
         scope.connectChannel(debug_scope.rx_count, "rx_count");
-        scope.set_trigger(&a_trigger);
-        scope.set_delay(0.75F); // About 75% history, 25% after manual/fault trigger.
-        scope.start();
+        // The buffer and channel names come from ScopeMimicry; main.cpp owns
+        // linear writes and export length. Do not call its circular acquire().
 
     }
     else{
@@ -626,7 +617,7 @@ void setup_routine()
  * It is used to send to the board via the computer the desired mode
  * IDLE (i) = block all modules or POWER (p) = operate with distributed capacitor-voltage sorting.
  * 
- * Scope: s rearms, a triggers, r triggers and retrieves once frozen in IDLE.
+ * Scope: p starts from IDLE, a/s restart, i/r freeze, r exports in IDLE.
  */
 void loop_communication_task()
 {
@@ -641,35 +632,42 @@ void loop_communication_task()
                "|     press i : idle mode                |\n"
                "|     press p : power mode               |\n"
                "|     press r : freeze/export in idle    |\n"
-               "|     press a : trigger scope            |\n"
-               "|     press s : rearm scope              |\n"
+               "|     press a : restart linear capture   |\n"
+               "|     press s : restart linear capture   |\n"
                "|________________________________________|\n\n");
         /*------------------------------------------------------ */
         break;
     case 'i':
         mode = IDLEMODE;
+        if (module_ID == MMC_SM1) scope_stop_requested = true;
         printk("idle mode\n");
         break;
     case 'p':
         if (module_ID == MMC_SM1)
         {
+            if (mode == IDLEMODE && !is_downloading)
+            {
+                scope_rearm_requested = true;
+                scope_stop_requested = false;
+            }
             mode = POWERMODE;
-            scope_fault_armed = true;
             printk("power mode\n");
         }
         break;
     case 'r':
         if (module_ID == MMC_SM1)
         {
-            enable_acq = true;
+            scope_stop_requested = true;
             is_downloading = true;
         }
         break;
     case 'a':
-        if (module_ID == MMC_SM1) enable_acq = true;
-        break;
     case 's':
-        if (module_ID == MMC_SM1 && !is_downloading) scope_rearm_requested = true;
+        if (module_ID == MMC_SM1 && !is_downloading)
+        {
+            scope_rearm_requested = true;
+            scope_stop_requested = false;
+        }
         break;
     default:
         break;
@@ -691,7 +689,8 @@ void loop_background_task()
             spin.led.turnOff();
             if (is_downloading && scope_ready)
             {
-                dump_scope_datas(scope);
+                if (scope_samples_recorded != 0) dump_scope_datas(scope);
+                else printk("No scope samples: press p or a to start capture\n");
                 is_downloading = false;
             }
         }
@@ -791,11 +790,8 @@ void loop_critical_task()
     {
         if (!is_downloading)
         {
-            scope.start();
             scope_ready = false;
-            enable_acq = false;
-            scope_fault_triggered = false;
-            scope_fault_armed = true;
+            scope_active = true;
             scope_timer = 0;
             scope_samples_recorded = 0;
         }
@@ -832,15 +828,24 @@ void loop_critical_task()
     }
 
     mmc_latch_action();
-    if (module_ID == MMC_SM1 && !scope_ready)
+    if (module_ID == MMC_SM1 && scope_active)
     {
-        if (scope_fault_armed && communication_fault) scope_fault_triggered = true;
-        if (++scope_timer >= scope_period)
+        const bool stop_capture = scope_stop_requested || communication_fault != 0;
+        if (++scope_timer >= scope_period || stop_capture)
         {
             mmc_update_debug_scope();
-            scope_ready = scope.acquire() == 2; // Library returns 2 once frozen.
-            if (!scope_ready && scope_samples_recorded < NB_DATAS) ++scope_samples_recorded;
+            if (scope_samples_recorded < NB_DATAS)
+            {
+                memcpy(scope.get_buffer() + scope_samples_recorded * sizeof(DebugScopeData),
+                       &debug_scope, sizeof(debug_scope));
+                ++scope_samples_recorded;
+            }
             scope_timer = 0;
+        }
+        if (stop_capture || scope_samples_recorded == NB_DATAS)
+        {
+            scope_active = false;
+            scope_ready = true;
         }
     }
     if (apply_power) critical_task_timer++;
